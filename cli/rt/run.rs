@@ -1,4 +1,4 @@
-// Copyright 2018-2025 the Deno authors. MIT license.
+// Copyright 2018-2026 the Deno authors. MIT license.
 
 use std::borrow::Cow;
 use std::path::Path;
@@ -1070,7 +1070,6 @@ pub async fn run(
     Some(sys.as_deno_rt_native_addon_loader()),
     feature_checker,
     fs,
-    None,
     None,
     Box::new(module_loader_factory),
     node_resolver.clone(),

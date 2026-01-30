@@ -1,4 +1,4 @@
-// Copyright 2018-2025 the Deno authors. MIT license.
+// Copyright 2018-2026 the Deno authors. MIT license.
 
 mod args;
 mod cache;
@@ -257,9 +257,9 @@ async fn run_subcommand(
     DenoSubcommand::Repl(repl_flags) => {
       spawn_subcommand(async move { tools::repl::run(flags, repl_flags).await })
     }
-    DenoSubcommand::X(x_flags) => spawn_subcommand(async move {
-      tools::x::run(flags, x_flags, unconfigured_runtime, roots).await
-    }),
+    DenoSubcommand::X(x_flags) => {
+      spawn_subcommand(async move { tools::x::run(flags, x_flags).await })
+    }
     DenoSubcommand::Run(run_flags) => spawn_subcommand(async move {
       if run_flags.print_task_list {
         let task_flags = TaskFlags {

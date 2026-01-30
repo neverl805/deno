@@ -1,4 +1,4 @@
-// Copyright 2018-2025 the Deno authors. MIT license.
+// Copyright 2018-2026 the Deno authors. MIT license.
 
 use std::rc::Rc;
 
@@ -101,6 +101,17 @@ pub struct GlobalsStorage {
 }
 
 impl GlobalsStorage {
+  /// Create a new GlobalsStorage with the given global objects
+  pub fn new(
+    deno_globals: v8::Global<v8::Object>,
+    node_globals: v8::Global<v8::Object>,
+  ) -> Self {
+    Self {
+      deno_globals,
+      node_globals,
+    }
+  }
+
   fn inner_for_mode(&self, mode: Mode) -> v8::Global<v8::Object> {
     match mode {
       Mode::Deno => &self.deno_globals,
