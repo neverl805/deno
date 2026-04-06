@@ -40821,6 +40821,7 @@ var libEntries = [
   ["es2022", "lib.es2022.d.ts"],
   ["es2023", "lib.es2023.d.ts"],
   ["es2024", "lib.es2024.d.ts"],
+  ["es2025", "lib.es2025.d.ts"],
   ["esnext", "lib.esnext.d.ts"],
   // Host only
   ["dom", "lib.dom.d.ts"],
@@ -40889,6 +40890,13 @@ var libEntries = [
   ["es2024.regexp", "lib.es2024.regexp.d.ts"],
   ["es2024.sharedmemory", "lib.es2024.sharedmemory.d.ts"],
   ["es2024.string", "lib.es2024.string.d.ts"],
+  ["es2025.collection", "lib.es2025.collection.d.ts"],
+  ["es2025.float16", "lib.es2025.float16.d.ts"],
+  ["es2025.full", "lib.es2025.full.d.ts"],
+  ["es2025.intl", "lib.es2025.intl.d.ts"],
+  ["es2025.iterator", "lib.es2025.iterator.d.ts"],
+  ["es2025.promise", "lib.es2025.promise.d.ts"],
+  ["es2025.regexp", "lib.es2025.regexp.d.ts"],
   ["esnext.array", "lib.es2023.array.d.ts"],
   ["esnext.collection", "lib.esnext.collection.d.ts"],
   ["esnext.symbol", "lib.es2019.symbol.d.ts"],
@@ -40899,6 +40907,7 @@ var libEntries = [
   ["esnext.string", "lib.es2022.string.d.ts"],
   ["esnext.promise", "lib.es2024.promise.d.ts"],
   ["esnext.weakref", "lib.es2021.weakref.d.ts"],
+  ["esnext.date", "lib.esnext.date.d.ts"],
   ["esnext.decorators", "lib.esnext.decorators.d.ts"],
   ["esnext.object", "lib.es2024.object.d.ts"],
   ["esnext.array", "lib.esnext.array.d.ts"],
@@ -40909,6 +40918,8 @@ var libEntries = [
   ["esnext.float16", "lib.esnext.float16.d.ts"],
   ["esnext.error", "lib.esnext.error.d.ts"],
   ["esnext.sharedmemory", "lib.esnext.sharedmemory.d.ts"],
+  ["esnext.temporal", "lib.esnext.temporal.d.ts"],
+  ["esnext.typedarrays", "lib.esnext.typedarrays.d.ts"],
   ["decorators", "lib.decorators.d.ts"],
   ["decorators.legacy", "lib.decorators.legacy.d.ts"]
 ];

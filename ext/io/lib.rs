@@ -10,8 +10,6 @@ use std::io::Read;
 use std::io::Seek;
 use std::io::Write;
 #[cfg(unix)]
-use std::os::fd::AsRawFd;
-#[cfg(unix)]
 use std::os::unix::io::FromRawFd;
 #[cfg(windows)]
 use std::os::windows::io::FromRawHandle;
@@ -48,7 +46,6 @@ use fs::FileResource;
 use fs::FsError;
 use fs::FsResult;
 use fs::FsStat;
-use fs3::FileExt;
 use once_cell::sync::Lazy;
 #[cfg(windows)]
 use parking_lot::Condvar;
@@ -212,17 +209,17 @@ pub static STDERR_HANDLE: Lazy<StdFile> = Lazy::new(|| {
 #[cfg(windows)]
 pub static STDIN_HANDLE: Lazy<StdFile> = Lazy::new(|| {
   // SAFETY: corresponds to OS stdin
-  unsafe { StdFile::from_raw_handle(GetStdHandle(winbase::STD_INPUT_HANDLE)) }
+  unsafe { StdFile::from_raw_handle(GetStdHandle(winbase::STD_INPUT_HANDLE) as std::os::windows::io::RawHandle) }
 });
 #[cfg(windows)]
 pub static STDOUT_HANDLE: Lazy<StdFile> = Lazy::new(|| {
   // SAFETY: corresponds to OS stdout
-  unsafe { StdFile::from_raw_handle(GetStdHandle(winbase::STD_OUTPUT_HANDLE)) }
+  unsafe { StdFile::from_raw_handle(GetStdHandle(winbase::STD_OUTPUT_HANDLE) as std::os::windows::io::RawHandle) }
 });
 #[cfg(windows)]
 pub static STDERR_HANDLE: Lazy<StdFile> = Lazy::new(|| {
   // SAFETY: corresponds to OS stderr
-  unsafe { StdFile::from_raw_handle(GetStdHandle(winbase::STD_ERROR_HANDLE)) }
+  unsafe { StdFile::from_raw_handle(GetStdHandle(winbase::STD_ERROR_HANDLE) as std::os::windows::io::RawHandle) }
 });
 
 deno_core::extension!(deno_io,
@@ -858,7 +855,10 @@ impl crate::fs::File for StdFileResourceInner {
         if mode & libc::S_IWRITE as u32 > 0 {
           // clippy warning should only be applicable to Unix platforms
           // https://rust-lang.github.io/rust-clippy/master/index.html#permissions_set_readonly_false
-          #[allow(clippy::permissions_set_readonly_false)]
+          #[allow(
+            clippy::permissions_set_readonly_false,
+            reason = "only applicable to Unix platforms"
+          )]
           permissions.set_readonly(false);
         } else {
           permissions.set_readonly(true);
@@ -886,7 +886,10 @@ impl crate::fs::File for StdFileResourceInner {
           if mode & libc::S_IWRITE as u32 > 0 {
             // clippy warning should only be applicable to Unix platforms
             // https://rust-lang.github.io/rust-clippy/master/index.html#permissions_set_readonly_false
-            #[allow(clippy::permissions_set_readonly_false)]
+            #[allow(
+              clippy::permissions_set_readonly_false,
+              reason = "only applicable to Unix platforms"
+            )]
             permissions.set_readonly(false);
           } else {
             permissions.set_readonly(true);
@@ -911,7 +914,9 @@ impl crate::fs::File for StdFileResourceInner {
     {
       let owner = _uid.map(nix::unistd::Uid::from_raw);
       let group = _gid.map(nix::unistd::Gid::from_raw);
-      let res = nix::unistd::fchown(self.handle, owner, group);
+      // SAFETY: self.handle is a valid open file descriptor
+      let raw_fd = unsafe { std::os::fd::BorrowedFd::borrow_raw(self.handle) };
+      let res = nix::unistd::fchown(raw_fd, owner, group);
       if let Err(err) = res {
         Err(io::Error::from_raw_os_error(err as i32).into())
       } else {
@@ -934,7 +939,7 @@ impl crate::fs::File for StdFileResourceInner {
           use std::os::fd::AsFd;
           let owner = _uid.map(nix::unistd::Uid::from_raw);
           let group = _gid.map(nix::unistd::Gid::from_raw);
-          nix::unistd::fchown(file.as_fd().as_raw_fd(), owner, group)
+          nix::unistd::fchown(file.as_fd(), owner, group)
             .map_err(|err| io::Error::from_raw_os_error(err as i32).into())
         })
         .await
@@ -1016,9 +1021,9 @@ impl crate::fs::File for StdFileResourceInner {
   fn lock_sync(self: Rc<Self>, exclusive: bool) -> FsResult<()> {
     self.with_sync(|file| {
       if exclusive {
-        file.lock_exclusive()?;
+        file.lock()?;
       } else {
-        fs3::FileExt::lock_shared(file)?;
+        file.lock_shared()?;
       }
       Ok(())
     })
@@ -1027,21 +1032,54 @@ impl crate::fs::File for StdFileResourceInner {
     self
       .with_inner_blocking_task(move |file| {
         if exclusive {
-          file.lock_exclusive()?;
+          file.lock()?;
         } else {
-          fs3::FileExt::lock_shared(file)?;
+          file.lock_shared()?;
         }
         Ok(())
       })
       .await
   }
 
+  fn try_lock_sync(self: Rc<Self>, exclusive: bool) -> FsResult<bool> {
+    use std::fs::TryLockError;
+    self.with_sync(|file| {
+      let result = if exclusive {
+        file.try_lock()
+      } else {
+        file.try_lock_shared()
+      };
+      match result {
+        Ok(()) => Ok(true),
+        Err(TryLockError::WouldBlock) => Ok(false),
+        Err(TryLockError::Error(err)) => Err(err.into()),
+      }
+    })
+  }
+  async fn try_lock_async(self: Rc<Self>, exclusive: bool) -> FsResult<bool> {
+    use std::fs::TryLockError;
+    self
+      .with_inner_blocking_task(move |file| {
+        let result = if exclusive {
+          file.try_lock()
+        } else {
+          file.try_lock_shared()
+        };
+        match result {
+          Ok(()) => Ok(true),
+          Err(TryLockError::WouldBlock) => Ok(false),
+          Err(TryLockError::Error(err)) => Err(err.into()),
+        }
+      })
+      .await
+  }
+
   fn unlock_sync(self: Rc<Self>) -> FsResult<()> {
-    self.with_sync(|file| Ok(fs3::FileExt::unlock(file)?))
+    self.with_sync(|file| Ok(file.unlock()?))
   }
   async fn unlock_async(self: Rc<Self>) -> FsResult<()> {
     self
-      .with_inner_blocking_task(|file| Ok(fs3::FileExt::unlock(file)?))
+      .with_inner_blocking_task(|file| Ok(file.unlock()?))
       .await
   }
 
@@ -1157,7 +1195,7 @@ pub fn op_read_create_cancel_handle(state: &mut OpState) -> u32 {
     .add(ReadCancelResource(CancelHandle::new_rc()))
 }
 
-#[op2(async)]
+#[op2]
 pub async fn op_read_with_cancel_handle(
   state: Rc<RefCell<OpState>>,
   #[smi] rid: u32,
@@ -1284,7 +1322,7 @@ pub fn stat_extra(file: &std::fs::File, fsstat: &mut FsStat) -> FsResult<()> {
 
   // SAFETY: winapi calls
   unsafe {
-    let file_handle = file.as_raw_handle();
+    let file_handle = file.as_raw_handle() as winapi::shared::ntdef::HANDLE;
 
     fsstat.dev = get_dev(file_handle)?;
 

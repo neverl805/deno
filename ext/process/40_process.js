@@ -6,14 +6,18 @@ import {
   op_run,
   op_run_status,
   op_spawn_child,
+  op_spawn_child_ref,
+  op_spawn_child_unref,
   op_spawn_kill,
   op_spawn_sync,
   op_spawn_wait,
 } from "ext:core/ops";
 const {
+  ArrayIsArray,
   ArrayPrototypeMap,
   ArrayPrototypeSlice,
   TypeError,
+  ObjectDefineProperty,
   ObjectEntries,
   SafeArrayIterator,
   String,
@@ -163,6 +167,7 @@ export const kExtraStdio = Symbol("extraStdio");
 export const kIpc = Symbol("ipc");
 export const kNeedsNpmProcessState = Symbol("needsNpmProcessState");
 export const kSerialization = Symbol("serialization");
+const kArgv0 = Symbol("argv0");
 
 const illegalConstructorKey = Symbol("illegalConstructorKey");
 
@@ -183,12 +188,14 @@ function spawnChildInner(command, apiName, {
   [kExtraStdio]: extraStdio = [],
   [kIpc]: ipc = -1,
   [kNeedsNpmProcessState]: needsNpmProcessState = false,
+  [kArgv0]: argv0 = undefined,
 } = { __proto__: null }) {
   const child = op_spawn_child({
     cmd: pathFromURL(command),
     args: ArrayPrototypeMap(args, String),
     cwd: pathFromURL(cwd),
     clearEnv,
+    argv0,
     env: ObjectEntries(env),
     uid,
     gid,
@@ -228,9 +235,17 @@ function collectOutput(readableStream) {
 
 const _ipcPipeRid = Symbol("[[ipcPipeRid]]");
 const _extraPipeRids = Symbol("[[_extraPipeRids]]");
+const _stdinRid = Symbol("[[stdinRid]]");
+const _stdoutRid = Symbol("[[stdoutRid]]");
+const _stderrRid = Symbol("[[stderrRid]]");
 
 internals.getIpcPipeRid = (process) => process[_ipcPipeRid];
 internals.getExtraPipeRids = (process) => process[_extraPipeRids];
+internals.getStdioRids = (process) => ({
+  stdinRid: process[_stdinRid],
+  stdoutRid: process[_stdoutRid],
+  stderrRid: process[_stderrRid],
+});
 internals.kExtraStdio = kExtraStdio;
 
 class ChildProcess {
@@ -240,6 +255,9 @@ class ChildProcess {
 
   [_ipcPipeRid];
   [_extraPipeRids];
+  [_stdinRid];
+  [_stdoutRid];
+  [_stderrRid];
 
   #pid;
   get pid() {
@@ -288,6 +306,9 @@ class ChildProcess {
     this.#pid = pid;
     this[_ipcPipeRid] = ipcPipeRid;
     this[_extraPipeRids] = extraPipeRids;
+    this[_stdinRid] = stdinRid;
+    this[_stdoutRid] = stdoutRid;
+    this[_stderrRid] = stderrRid;
 
     if (stdinRid !== null) {
       this.#stdin = writableStreamForRid(stdinRid);
@@ -386,12 +407,18 @@ class ChildProcess {
     core.refOpPromise(this.#waitPromise);
     if (this.#stdout) readableStreamForRidUnrefableRef(this.#stdout);
     if (this.#stderr) readableStreamForRidUnrefableRef(this.#stderr);
+    if (!this.#waitComplete) {
+      op_spawn_child_ref(this.#rid);
+    }
   }
 
   unref() {
     core.unrefOpPromise(this.#waitPromise);
     if (this.#stdout) readableStreamForRidUnrefableUnref(this.#stdout);
     if (this.#stderr) readableStreamForRidUnrefableUnref(this.#stderr);
+    if (!this.#waitComplete) {
+      op_spawn_child_unref(this.#rid);
+    }
   }
 }
 
@@ -421,7 +448,7 @@ class ReadableStreamWithCollectors extends ReadableStream {
   }
 }
 
-function spawn(command, options) {
+function spawnInner(command, options) {
   if (options?.stdin === "piped") {
     throw new TypeError(
       "Piped stdin is not supported for this function, use 'Deno.Command().spawn()' instead",
@@ -435,7 +462,7 @@ function spawn(command, options) {
     .output();
 }
 
-function spawnSync(command, {
+function spawnSyncInner(command, {
   args = [],
   cwd = undefined,
   clearEnv = false,
@@ -448,6 +475,7 @@ function spawnSync(command, {
   windowsRawArguments = false,
   [kInputOption]: input,
   [kNeedsNpmProcessState]: needsNpmProcessState = false,
+  [kArgv0]: argv0 = undefined,
 } = { __proto__: null }) {
   if (stdin === "piped") {
     throw new TypeError(
@@ -470,8 +498,9 @@ function spawnSync(command, {
     detached: false,
     needsNpmProcessState,
     input,
+    argv0,
   });
-  return {
+  const output = {
     success: result.status.success,
     code: result.status.code,
     signal: result.status.signal,
@@ -488,6 +517,13 @@ function spawnSync(command, {
       return result.stderr;
     },
   };
+  // Internal field used by node:child_process, hidden from Deno public API.
+  ObjectDefineProperty(output, "_pid", {
+    __proto__: null,
+    value: result.pid,
+    enumerable: false,
+  });
+  return output;
 }
 
 class Command {
@@ -505,7 +541,7 @@ class Command {
         "Piped stdin is not supported for this function, use 'Deno.Command.spawn()' instead",
       );
     }
-    return spawn(this.#command, this.#options);
+    return spawnInner(this.#command, this.#options);
   }
 
   outputSync() {
@@ -514,7 +550,7 @@ class Command {
         "Piped stdin is not supported for this function, use 'Deno.Command.spawn()' instead",
       );
     }
-    return spawnSync(this.#command, this.#options);
+    return spawnSyncInner(this.#command, this.#options);
   }
 
   spawn() {
@@ -529,4 +565,55 @@ class Command {
   }
 }
 
-export { ChildProcess, Command, kill, kInputOption, Process, run };
+function spawn(command, argsOrOptions, maybeOptions) {
+  if (ArrayIsArray(argsOrOptions)) {
+    const options = maybeOptions ?? {};
+    if (options.args !== undefined) {
+      throw new TypeError(
+        "Passing 'args' in options is not allowed when args are passed as a separate argument",
+      );
+    }
+    return new Command(command, { ...options, args: argsOrOptions }).spawn();
+  }
+  return new Command(command, argsOrOptions).spawn();
+}
+
+function spawnAndWait(command, argsOrOptions, maybeOptions) {
+  if (ArrayIsArray(argsOrOptions)) {
+    const options = maybeOptions ?? {};
+    if (options.args !== undefined) {
+      throw new TypeError(
+        "Passing 'args' in options is not allowed when args are passed as a separate argument",
+      );
+    }
+    return new Command(command, { ...options, args: argsOrOptions }).output();
+  }
+  return new Command(command, argsOrOptions).output();
+}
+
+function spawnAndWaitSync(command, argsOrOptions, maybeOptions) {
+  if (ArrayIsArray(argsOrOptions)) {
+    const options = maybeOptions ?? {};
+    if (options.args !== undefined) {
+      throw new TypeError(
+        "Passing 'args' in options is not allowed when args are passed as a separate argument",
+      );
+    }
+    return new Command(command, { ...options, args: argsOrOptions })
+      .outputSync();
+  }
+  return new Command(command, argsOrOptions).outputSync();
+}
+
+export {
+  ChildProcess,
+  Command,
+  kArgv0,
+  kill,
+  kInputOption,
+  Process,
+  run,
+  spawn,
+  spawnAndWait,
+  spawnAndWaitSync,
+};

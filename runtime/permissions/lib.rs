@@ -55,7 +55,15 @@ pub enum BrokerResponse {
 use self::broker::has_broker;
 use self::broker::maybe_check_with_broker;
 
-pub static AUDIT_FILE: OnceLock<Mutex<std::fs::File>> = OnceLock::new();
+pub type OtelAuditFn =
+  fn(permission: &str, value: &str, stack: Option<&[String]>);
+
+pub enum AuditSink {
+  File(Mutex<std::fs::File>),
+  Otel(OtelAuditFn),
+}
+
+pub static AUDIT_SINK: OnceLock<AuditSink> = OnceLock::new();
 
 #[derive(Debug, thiserror::Error, deno_error::JsError)]
 #[error("{}", custom_message.as_ref().cloned().unwrap_or_else(|| format!("Requires {access}, {}", format_permission_error(.name))))]
@@ -81,34 +89,55 @@ fn write_audit<T>(flag_name: &str, value: T)
 where
   T: Serialize,
 {
-  let Some(file) = AUDIT_FILE.get() else {
+  let Some(sink) = AUDIT_SINK.get() else {
     return;
   };
 
-  let mut file = file.lock();
-
-  let mut map = serde_json::Map::with_capacity(5);
-  let _ = map.insert("v".into(), serde_json::Value::Number(1.into()));
-  let _ = map.insert(
-    "datetime".into(),
-    serde_json::Value::String(
-      chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-    ),
-  );
-  let _ = map.insert(
-    "permission".into(),
-    serde_json::to_value(flag_name).unwrap(),
-  );
-  let _ = map.insert("value".into(), serde_json::to_value(value).unwrap());
-
   let get_stack = MAYBE_CURRENT_STACKTRACE.lock();
-  if let Some(stack) = get_stack.as_ref().map(|s| s()) {
-    let _ = map.insert("stack".into(), serde_json::to_value(&stack).unwrap());
-  }
+  let stack = get_stack.as_ref().map(|s| s());
 
-  let _ = file.write_all(
-    format!("{}\n", serde_json::to_string(&map).unwrap()).as_bytes(),
-  );
+  match sink {
+    AuditSink::File(file) => {
+      let mut file = file.lock();
+
+      let mut map = serde_json::Map::with_capacity(6);
+      let _ = map.insert("v".into(), serde_json::Value::Number(1.into()));
+      let _ = map.insert(
+        "datetime".into(),
+        #[allow(
+          clippy::disallowed_methods,
+          reason = "TODO: support passing in a sys here"
+        )]
+        serde_json::Value::String(
+          chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        ),
+      );
+      let _ = map.insert(
+        "permission".into(),
+        serde_json::to_value(flag_name).unwrap(),
+      );
+      let _ = map.insert("value".into(), serde_json::to_value(&value).unwrap());
+
+      if let Some(ref stack) = stack {
+        let _ =
+          map.insert("stack".into(), serde_json::to_value(stack).unwrap());
+      }
+
+      let _ = file.write_all(
+        format!("{}\n", serde_json::to_string(&map).unwrap()).as_bytes(),
+      );
+    }
+    AuditSink::Otel(report_fn) => {
+      let value_str = serde_json::to_value(&value)
+        .map(|v| match v {
+          serde_json::Value::String(s) => s,
+          other => other.to_string(),
+        })
+        .unwrap_or_default();
+
+      report_fn(flag_name, &value_str, stack.as_deref());
+    }
+  }
 }
 
 /// Fast exit from permission check routines if this permission
@@ -392,7 +421,7 @@ impl AsRef<Path> for CheckedPathBuf {
 /// want to wastefully check for partial denials when, say, checking read
 /// access for a file.
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
-#[allow(clippy::enum_variant_names)]
+#[allow(clippy::enum_variant_names, reason = "more clear")]
 enum AllowPartial {
   TreatAsGranted,
   TreatAsDenied,
@@ -1263,6 +1292,9 @@ impl<
 #[derive(Clone, Debug)]
 pub struct PathQueryDescriptor<'a> {
   path: Cow<'a, Path>,
+  /// Lowercased on Windows for case-insensitive comparison; same as `path` on
+  /// other platforms. Used by PartialEq, starts_with, etc.
+  cmp_path: PathBuf,
   /// Custom requested display name when differs from resolved.
   requested: Option<String>,
   is_windows_device_path: bool,
@@ -1270,7 +1302,7 @@ pub struct PathQueryDescriptor<'a> {
 
 impl PartialEq for PathQueryDescriptor<'_> {
   fn eq(&self, other: &Self) -> bool {
-    self.path == other.path
+    self.cmp_path == other.cmp_path
   }
 }
 
@@ -1278,7 +1310,18 @@ impl Eq for PathQueryDescriptor<'_> {}
 
 impl PartialEq<PathDescriptor> for PathQueryDescriptor<'_> {
   fn eq(&self, other: &PathDescriptor) -> bool {
-    self.path == other.path
+    self.cmp_path == other.cmp_path
+  }
+}
+
+/// On Windows, returns a lowercased copy of the path for case-insensitive
+/// comparison, matching NTFS behavior. On other platforms, returns a clone.
+#[inline]
+fn comparison_path(path: &Path) -> PathBuf {
+  if cfg!(windows) {
+    PathBuf::from(path.to_string_lossy().to_ascii_lowercase())
+  } else {
+    path.to_path_buf()
   }
 }
 
@@ -1309,8 +1352,10 @@ impl<'a> PathQueryDescriptor<'a> {
         Some(path.to_string_lossy().into_owned()),
       )
     };
+    let cmp_path = comparison_path(&path);
     Ok(Self {
       path,
+      cmp_path,
       requested,
       is_windows_device_path,
     })
@@ -1328,8 +1373,10 @@ impl<'a> PathQueryDescriptor<'a> {
     } else {
       normalize_path(path)
     };
+    let cmp_path = comparison_path(&path);
     Self {
       path,
+      cmp_path,
       requested: None,
       is_windows_device_path,
     }
@@ -1343,7 +1390,7 @@ impl<'a> PathQueryDescriptor<'a> {
   }
 
   pub fn starts_with(&self, base: &PathDescriptor) -> bool {
-    self.path.starts_with(&base.path)
+    self.cmp_path.starts_with(&base.cmp_path)
   }
 
   pub fn display_name(&self) -> Cow<'_, str> {
@@ -1356,6 +1403,7 @@ impl<'a> PathQueryDescriptor<'a> {
   pub fn as_descriptor(&self) -> PathDescriptor {
     PathDescriptor {
       path: self.path.to_path_buf(),
+      cmp_path: self.cmp_path.clone(),
       requested: self.requested.clone(),
       is_windows_device_path: self.is_windows_device_path,
     }
@@ -1364,6 +1412,7 @@ impl<'a> PathQueryDescriptor<'a> {
   pub fn into_descriptor(self) -> PathDescriptor {
     PathDescriptor {
       path: self.path.into_owned(),
+      cmp_path: self.cmp_path,
       requested: self.requested,
       is_windows_device_path: self.is_windows_device_path,
     }
@@ -1446,6 +1495,9 @@ impl QueryDescriptor for ReadQueryDescriptor<'_> {
 #[derive(Clone, Debug)]
 pub struct PathDescriptor {
   path: PathBuf,
+  /// Lowercased on Windows for case-insensitive comparison; same as `path` on
+  /// other platforms. Used by PartialEq, Hash, starts_with, cmp_*.
+  cmp_path: PathBuf,
   /// Custom requested display name when differs from resolved.
   requested: Option<String>,
   is_windows_device_path: bool,
@@ -1453,7 +1505,7 @@ pub struct PathDescriptor {
 
 impl PartialEq for PathDescriptor {
   fn eq(&self, other: &Self) -> bool {
-    self.path == other.path
+    self.cmp_path == other.cmp_path
   }
 }
 
@@ -1461,7 +1513,7 @@ impl Eq for PathDescriptor {}
 
 impl Hash for PathDescriptor {
   fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-    self.path.hash(state);
+    self.cmp_path.hash(state);
   }
 }
 
@@ -1490,8 +1542,10 @@ impl PathDescriptor {
         Some(path.to_string_lossy().into_owned()),
       )
     };
+    let cmp_path = comparison_path(&path);
     Self {
       path: path.into_owned(),
+      cmp_path,
       requested: display,
       is_windows_device_path,
     }
@@ -1502,7 +1556,7 @@ impl PathDescriptor {
   }
 
   pub fn starts_with(&self, base: &PathQueryDescriptor) -> bool {
-    self.path.starts_with(&base.path)
+    self.cmp_path.starts_with(&base.cmp_path)
   }
 
   pub fn display_name(&self) -> Cow<'_, str> {
@@ -1515,6 +1569,7 @@ impl PathDescriptor {
   pub fn as_query_descriptor(&self) -> PathQueryDescriptor<'static> {
     PathQueryDescriptor {
       path: Cow::Owned(self.path.clone()),
+      cmp_path: self.cmp_path.clone(),
       requested: self.requested.clone(),
       is_windows_device_path: self.is_windows_device_path,
     }
@@ -1537,21 +1592,21 @@ impl PathDescriptor {
   }
 
   fn cmp_allow_allow(&self, other: &PathDescriptor) -> Ordering {
-    if self.path == other.path {
+    if self.cmp_path == other.cmp_path {
       Ordering::Equal
-    } else if other.path.starts_with(&self.path) {
+    } else if other.cmp_path.starts_with(&self.cmp_path) {
       Ordering::Greater
-    } else if self.path.starts_with(&other.path) {
+    } else if self.cmp_path.starts_with(&other.cmp_path) {
       Ordering::Less
     } else {
-      self.path.cmp(&other.path)
+      self.cmp_path.cmp(&other.cmp_path)
     }
   }
 
   fn cmp_allow_deny(&self, other: &PathDescriptor) -> Ordering {
-    if other.path.starts_with(&self.path) {
+    if other.cmp_path.starts_with(&self.cmp_path) {
       Ordering::Greater
-    } else if self.path.starts_with(&other.path) {
+    } else if self.cmp_path.starts_with(&other.cmp_path) {
       Ordering::Less
     } else {
       Ordering::Greater
@@ -2460,11 +2515,15 @@ impl<'a> RunQueryDescriptor<'a> {
         .map_err(PathResolveError::CwdResolve)?;
       match which::which_in(sys.clone(), requested, sys.env_var_os("PATH"), cwd)
       {
-        Ok(resolved) => Ok(RunQueryDescriptor::Path(PathQueryDescriptor {
-          path: Cow::Owned(resolved),
-          requested: Some(requested.to_string()),
-          is_windows_device_path: false,
-        })),
+        Ok(resolved) => {
+          let cmp_path = comparison_path(&resolved);
+          Ok(RunQueryDescriptor::Path(PathQueryDescriptor {
+            path: Cow::Owned(resolved),
+            cmp_path,
+            requested: Some(requested.to_string()),
+            is_windows_device_path: false,
+          }))
+        }
         Err(_) => Ok(RunQueryDescriptor::Name(requested.to_string())),
       }
     }
@@ -2585,7 +2644,7 @@ pub enum RunDescriptorArg {
 }
 
 pub enum AllowRunDescriptorParseResult {
-  /// An error occured getting the descriptor that should
+  /// An error occurred getting the descriptor that should
   /// be surfaced as a warning when launching deno, but should
   /// be ignored when creating a worker.
   Unresolved(Box<which::Error>),
@@ -2740,6 +2799,7 @@ impl<'a> SpecialFilePathQueryDescriptor<'a> {
     let PathQueryDescriptor {
       is_windows_device_path,
       path,
+      cmp_path: _,
       requested,
     } = path;
     // On Linux, /proc may contain magic links that we don't want to resolve
@@ -4025,7 +4085,7 @@ impl PermissionsContainer {
       })
     } else {
       let path = self.descriptor_parser.parse_special_file_descriptor(path)?;
-      self.check_special_file(path, api_name)
+      self.check_special_file(path, access_kind, api_name)
     }
   }
 
@@ -4177,21 +4237,32 @@ impl PermissionsContainer {
   pub fn check_special_file<'a>(
     &self,
     path: SpecialFilePathQueryDescriptor<'a>,
+    access_kind: OpenAccessKind,
     _api_name: Option<&str>,
   ) -> Result<CheckedPath<'a>, PermissionCheckError> {
     let requested = path.requested;
     let canonicalized = path.canonicalized;
     let path = path.path;
 
-    // Safe files with no major additional side-effects. While there's a small risk of someone
-    // draining system entropy by just reading one of these files constantly, that's not really
-    // something we worry about as they already have --allow-read to /dev.
+    // Safe files with no major additional side-effects.
     if cfg!(unix)
       && (path == OsStr::new("/dev/random")
         || path == OsStr::new("/dev/urandom")
         || path == OsStr::new("/dev/zero")
         || path == OsStr::new("/dev/null"))
     {
+      return Ok(CheckedPath {
+        path: PathWithRequested {
+          path,
+          requested: requested.map(Cow::Owned),
+        },
+        canonicalized,
+      });
+    }
+
+    // We allow /dev/tty access specifically for checking isatty() or reading input,
+    // but we BLOCK write access to prevent permission prompt spoofing attacks.
+    if cfg!(unix) && path == OsStr::new("/dev/tty") && !access_kind.is_write() {
       return Ok(CheckedPath {
         path: PathWithRequested {
           path,
@@ -4257,6 +4328,9 @@ impl PermissionsContainer {
       {
         if path.ends_with("/environ") {
           self.check_env_all()?;
+        } else if path.starts_with("/proc/pressure/") {
+          // Allow /proc/pressure/* files with just --allow-read since they are
+          // read-only system monitoring files that only expose performance metrics
         } else {
           self.check_has_all_permissions(&path)?;
         }
@@ -5251,6 +5325,7 @@ mod tests {
   use fqdn::fqdn;
   use prompter::tests::*;
   use serde_json::json;
+  use sys_traits::EnvCurrentDir;
 
   use super::*;
   use crate::prompter::set_prompter;
@@ -5270,8 +5345,10 @@ mod tests {
       } else {
         PathBuf::from("/").join(path)
       };
+      let cmp_path = comparison_path(&path);
       PathDescriptor {
         path,
+        cmp_path,
         requested: None,
         is_windows_device_path: false,
       }
@@ -5352,8 +5429,10 @@ mod tests {
       &self,
       path: Cow<'a, Path>,
     ) -> Result<PathQueryDescriptor<'a>, PathResolveError> {
+      let cmp_path = comparison_path(&path);
       Ok(PathQueryDescriptor {
         path,
+        cmp_path,
         requested: None,
         is_windows_device_path: false,
       })
@@ -6191,8 +6270,7 @@ mod tests {
         .is_err()
     );
 
-    #[allow(clippy::disallowed_methods)]
-    let cwd = std::env::current_dir().unwrap();
+    let cwd = sys_traits::impls::RealSys.env_current_dir().unwrap();
     prompt_value.set(true);
     assert!(
       perms
@@ -6357,8 +6435,7 @@ mod tests {
     );
 
     prompt_value.set(false);
-    #[allow(clippy::disallowed_methods)]
-    let cwd = std::env::current_dir().unwrap();
+    let cwd = sys_traits::impls::RealSys.env_current_dir().unwrap();
     assert!(
       perms
         .run
@@ -9147,6 +9224,67 @@ mod tests {
         Ordering::Equal => Ordering::Equal,
       },
       "failed second to first"
+    );
+  }
+
+  #[test]
+  #[cfg(windows)]
+  fn check_path_case_insensitive() {
+    set_prompter(Box::new(TestPrompter));
+    let parser = TestPermissionDescriptorParser;
+    let perms = Permissions::from_options(
+      &parser,
+      &PermissionsOptions {
+        allow_read: Some(svec!["C:\\Users\\Admin"]),
+        deny_read: Some(svec!["C:\\Users\\Admin\\Secret"]),
+        ..Default::default()
+      },
+    )
+    .unwrap();
+    let perms = PermissionsContainer::new(Arc::new(parser), perms);
+
+    // Matching case should be allowed
+    assert!(
+      perms
+        .check_open(
+          Cow::Borrowed(Path::new("C:\\Users\\Admin\\file.txt")),
+          OpenAccessKind::Read,
+          Some("api"),
+        )
+        .is_ok()
+    );
+
+    // Different case should also be allowed
+    assert!(
+      perms
+        .check_open(
+          Cow::Borrowed(Path::new("c:\\users\\admin\\file.txt")),
+          OpenAccessKind::Read,
+          Some("api"),
+        )
+        .is_ok()
+    );
+
+    // Deny with matching case should block
+    assert!(
+      perms
+        .check_open(
+          Cow::Borrowed(Path::new("C:\\Users\\Admin\\Secret\\data.txt")),
+          OpenAccessKind::Read,
+          Some("api"),
+        )
+        .is_err()
+    );
+
+    // Deny with different case should also block
+    assert!(
+      perms
+        .check_open(
+          Cow::Borrowed(Path::new("c:\\users\\admin\\secret\\data.txt")),
+          OpenAccessKind::Read,
+          Some("api"),
+        )
+        .is_err()
     );
   }
 }

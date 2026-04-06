@@ -5,23 +5,13 @@
 import { core, internals } from "ext:core/mod.js";
 const requireImpl = internals.requireImpl;
 
+import { op_stream_base_register_state } from "ext:core/ops";
 import { nodeGlobals } from "ext:deno_node/00_globals.js";
-import { kStreamBaseField } from "ext:deno_node/internal_binding/stream_wrap.ts";
+import {
+  kStreamBaseField,
+  streamBaseState,
+} from "ext:deno_node/internal_binding/stream_wrap.ts";
 import "node:module";
-
-// CRITICAL for never-jscore: Set up Deno.internal to point to internals
-// This is normally done in Deno's 99_main.js but never-jscore doesn't use that
-// The CJS module wrapper in 01_require.js uses Deno[Deno.internal].nodeGlobals
-if (typeof Deno !== "undefined" && typeof Deno.internal === "undefined") {
-  const internalSymbol = Symbol("Deno.internal");
-  Object.defineProperty(Deno, "internal", {
-    value: internalSymbol,
-    writable: false,
-    enumerable: false,
-    configurable: false,
-  });
-  Deno[internalSymbol] = internals;
-}
 
 let initialized = false;
 
@@ -52,6 +42,8 @@ function initialize(args) {
       Deno.args,
       Deno.version,
       nodeDebug ?? "",
+      false,
+      runningOnMainThread,
     );
     internals.__initWorkerThreads(
       runningOnMainThread,
@@ -60,6 +52,7 @@ function initialize(args) {
       moduleSpecifier,
     );
     internals.__setupChildProcessIpcChannel();
+    op_stream_base_register_state(streamBaseState);
     // `Deno[Deno.internal].requireImpl` will be unreachable after this line.
     delete internals.requireImpl;
   } else {
@@ -167,11 +160,6 @@ nodeGlobals.process = nativeModuleExports["process"];
 nodeGlobals.setImmediate = nativeModuleExports["timers"].setImmediate;
 nodeGlobals.setInterval = nativeModuleExports["timers"].setInterval;
 nodeGlobals.setTimeout = nativeModuleExports["timers"].setTimeout;
-
-// CRITICAL for never-jscore: Set up internals.nodeGlobals for CJS module wrapper
-// The CJS module wrapper in 01_require.js uses Deno[Deno.internal].nodeGlobals
-// This is normally done in Deno's 99_main.js but never-jscore doesn't use that
-internals.nodeGlobals = nodeGlobals;
 
 nativeModuleExports["internal/console/constructor"].bindStreamsLazy(
   nativeModuleExports["console"],

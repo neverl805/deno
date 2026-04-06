@@ -319,6 +319,48 @@ Deno.test("tlssocket._handle._parentWrap is set", () => {
   assertInstanceOf(parentWrap, stream.PassThrough);
 });
 
+Deno.test("net.Socket reinitialize preserves TLS upgrade state", () => {
+  const socket = new net.Socket();
+  const reinitializeHandle = Object.getOwnPropertySymbols(net.Socket.prototype)
+    .find((symbol) => symbol.description === "kReinitializeHandle");
+
+  assert(reinitializeHandle, "expected kReinitializeHandle symbol");
+  const reinitializeHandleSymbol = reinitializeHandle as symbol;
+
+  let closed = false;
+  const afterConnectTls = function () {};
+  const verifyError = () => null;
+  const parentWrap = new stream.PassThrough();
+
+  // deno-lint-ignore no-explicit-any
+  (socket as any)._handle = {
+    close() {
+      closed = true;
+    },
+    afterConnectTls,
+    verifyError,
+    _parentWrap: parentWrap,
+  };
+
+  const newHandle = {};
+  // deno-lint-ignore no-explicit-any
+  (socket as any)[reinitializeHandleSymbol](newHandle);
+
+  assert(closed);
+  // deno-lint-ignore no-explicit-any
+  assertEquals((newHandle as any).afterConnectTls, afterConnectTls);
+  // deno-lint-ignore no-explicit-any
+  assertEquals(typeof (newHandle as any).afterConnectTlsResolve, "function");
+  // deno-lint-ignore no-explicit-any
+  assert((newHandle as any).upgrading instanceof Promise);
+  // deno-lint-ignore no-explicit-any
+  assertEquals((newHandle as any).verifyError, verifyError);
+  // deno-lint-ignore no-explicit-any
+  assertEquals((newHandle as any)._parent, newHandle);
+  // deno-lint-ignore no-explicit-any
+  assertEquals((newHandle as any)._parentWrap, parentWrap);
+});
+
 Deno.test({
   name: "tls connect upgrade js socket wrapper",
   sanitizeOps: false,
@@ -478,4 +520,44 @@ BnRlc3RDQTCB
 
   // deno-lint-ignore no-explicit-any
   (tls as any).setDefaultCACertificates([testCert]);
+});
+
+// https://github.com/denoland/deno/issues/30170
+Deno.test("tls.connect strips trailing dot from servername", async () => {
+  const listener = Deno.listenTls({
+    port: 0,
+    key,
+    cert,
+  });
+
+  const conn = tls.connect({
+    host: "localhost",
+    port: listener.addr.port,
+    // Use trailing dot - should be normalized to "localhost"
+    servername: "localhost.",
+    secureContext: {
+      ca: rootCaCert,
+      // deno-lint-ignore no-explicit-any
+    } as any,
+  });
+
+  const serverConn = await listener.accept();
+
+  const { promise: connected, resolve: resolveConnected } = Promise
+    .withResolvers<void>();
+  conn.on("secureConnect", () => {
+    assert(conn.authorized, "Connection should be authorized");
+    resolveConnected();
+  });
+
+  conn.on("error", (err: Error) => {
+    // Should not get a certificate error with trailing dot
+    throw err;
+  });
+
+  await connected;
+  conn.destroy();
+  serverConn.close();
+  listener.close();
+  await new Promise((resolve) => conn.on("close", resolve));
 });
