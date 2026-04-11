@@ -112,7 +112,10 @@ fn create_named_pipe_inner() -> io::Result<(RawHandle, RawHandle)> {
     return Err(err);
   }
 
-  Ok((server_handle as RawHandle, client_handle as RawHandle))
+  Ok((
+    server_handle as RawHandle,
+    client_handle as RawHandle,
+  ))
 }
 
 #[cfg(test)]
